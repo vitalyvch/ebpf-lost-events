@@ -1,0 +1,152 @@
+#!/bin/bash
+#
+# Copyright 2017, Intel Corporation
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in
+#       the documentation and/or other materials provided with the
+#       distribution.
+#
+#     * Neither the name of the copyright holder nor the names of its
+#       contributors may be used to endorse or promote products derived
+#       from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#
+# test-trace_py -- test for trace_py
+#
+
+if [ "$2" == "" ]; then
+	echo "Usage: $0 <test-file> <test-number>"
+	exit 1
+fi
+
+TEST_NUM=$2
+TEST_FILE=$1
+if [ ! -x $TEST_FILE ]; then
+	echo "Error: executable file '$TEST_FILE' does not exist"
+	exit 1
+fi
+
+
+PATTERN_START='close *12345678'
+PATTERN_END='close *87654321'
+OUT=output-$TEST_NUM.log
+OUT_BARE=output-bare-$TEST_NUM.log
+OUT_SORT=output-sort-$TEST_NUM.log
+
+OPT_TRACE_PY="-t 'sys_close \"%llx\", arg1' sys_futex 'r::sys_futex \"retval=%llx\", retval' sys_poll 'r::sys_poll \"retval=%llx\", retval'"
+
+# XXX drop hard-coded path
+export PATH="${PATH}:/home/vitalii/projects/bcc/tools/"
+
+TRACE_PY=`which trace.py`
+[ ! -x $TRACE_PY ] \
+	&& echo "Error: executable file '$TRACE_PY' does not exist" \
+	&& exit 1
+
+#
+# require_superuser -- require superuser capabilities
+#
+function require_superuser() {
+	local user_id=$(sudo -n id -u)
+	[ "$user_id" == "0" ] && return
+	echo "Superuser rights required, please enter root's password:"
+	sudo date > /dev/null
+	[ $? -eq 0 ] && return
+	echo "Authentication failed, aborting..."
+	exit 1
+}
+
+require_superuser
+
+# remove all logs of the current test
+rm -f *-$TEST_NUM.log
+
+# run tests
+#echo "# WAIT_TRACE_PY=1 $TEST_FILE $TEST_NUM >/dev/null &"
+WAIT_TRACE_PY=1 $TEST_FILE $TEST_NUM >/dev/null &
+
+TEST_PID=$!
+
+RUN_TRACE_PY="exec stdbuf -o L $TRACE_PY -p $TEST_PID ${OPT_TRACE_PY}"
+
+#echo "# sudo bash -c \"$RUN_TRACE_PY\" >$OUT 2>&1 &"
+sudo bash -c "$RUN_TRACE_PY" >$OUT 2>&1 &
+
+TRACE_PY_PID=$!
+
+sleep 1
+
+kill -CONT $TEST_PID
+
+wait $TEST_PID 
+
+sudo pkill -INT -f "^python.*trace.py"
+
+sleep 1
+
+#XXX SIGINT does not work for unknown reason.
+# So, let's do -KILL and manual cleanup.
+sudo pkill -KILL -f "^python.*trace.py" >/dev/null 2>&1
+#XXX Manual clean-up
+
+wait $TRACE_PY_PID  >/dev/null 2>&1
+
+grep -v -e 'PID.*TID' -e "$OUT" $OUT > $OUT_BARE
+
+# tests without fork()
+sort $OUT_BARE -o $OUT_SORT
+
+
+#
+# get_line_of_pattern -- get a line number of the first pattern in the file
+#                        get_line_of_pattern <file> <pattern>
+#
+function get_line_of_pattern() {
+	local LINE=$(grep -n "$2" $1 | cut -d: -f1 | head -n1)
+	echo $LINE
+}
+
+#
+# cut_part_file -- cut part of the file $1
+#                  starting from the pattern $2
+#                  ending at the pattern $3
+#
+function cut_part_file() {
+
+	local FILE=$1
+	local PATTERN1=$2
+	local PATTERN2=$3
+
+	local LINE1=$(get_line_of_pattern $FILE "$PATTERN1")
+	[ "$LINE1" == "" ] \
+		&& echo "Error: cut_part_file(): the start-pattern \"$PATTERN1\" not found in file $FILE" \
+		&& return
+
+	local LINE2=$(get_line_of_pattern $FILE "$PATTERN2")
+	[ "$LINE2" == "" ] \
+		&& LINE2=$(cat $FILE | wc -l) # print the file till the end
+
+	sed -n ${LINE1},${LINE2}p $FILE
+}
+
+cut_part_file $OUT_SORT "$PATTERN_START" "$PATTERN_END" > cut-$TEST_NUM.log
