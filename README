@@ -1,3 +1,6 @@
+Minimal environment to reproduce lost events from handlers
+
+
 ** USAGE **
 
 $ test-trace_py-futex.sh
